@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,6 +13,47 @@ import (
 	"strings"
 	"time"
 )
+
+// DefaultModel is the Gemini model to use (can be overridden by GEMINI_MODEL env var)
+const DefaultModel = "gemini-1.5-flash"
+
+// GeminiResponse is the structured response from the Gemini API
+type GeminiResponse struct {
+	Candidates []struct {
+		Content struct {
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+		} `json:"content"`
+	} `json:"candidates"`
+	Error *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Status  string `json:"status"`
+	} `json:"error,omitempty"`
+}
+
+// Retry configuration
+const (
+	maxRetries     = 3
+	initialBackoff = 500 * time.Millisecond
+	maxBackoff     = 5 * time.Second
+)
+
+// getModel returns the configured Gemini model
+func getModel() string {
+	if model := os.Getenv("GEMINI_MODEL"); model != "" {
+		return model
+	}
+	return DefaultModel
+}
+
+// isRetryableError returns true if the error/status code is transient
+func isRetryableError(statusCode int) bool {
+	// Retry on rate limits (429), server errors (5xx), and some client errors
+	return statusCode == 429 || statusCode == 500 || statusCode == 502 ||
+		statusCode == 503 || statusCode == 504
+}
 
 // ScanResults holds the results of an AI project scan
 type ScanResults struct {
@@ -37,11 +79,17 @@ func ValidateKey(apiKey string) (bool, error) {
 		return false, fmt.Errorf("API key is empty")
 	}
 
-	// Simple validation - try to make a request
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models?key=%s", apiKey)
+	// Simple validation - try to list models using header auth (not URL param)
+	url := "https://generativelanguage.googleapis.com/v1beta/models"
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return false, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("x-goog-api-key", apiKey)
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(url)
+	resp, err := client.Do(req)
 	if err != nil {
 		return false, fmt.Errorf("failed to connect to Gemini API: %w", err)
 	}
@@ -69,7 +117,8 @@ func ScanProject(apiKey string, dir string) (*ScanResults, error) {
 	// Call Gemini API
 	response, err := callGemini(apiKey, prompt)
 	if err != nil {
-		// Fall back to local analysis
+		// Fall back to local analysis - log the reason
+		log.Printf("Gemini API failed (%v), using local analysis", err)
 		return localAnalysis(info), nil
 	}
 
@@ -110,7 +159,10 @@ func gatherProjectInfo(dir string) *ProjectInfo {
 
 	// Read package.json if exists
 	if data, err := os.ReadFile(filepath.Join(dir, "package.json")); err == nil {
-		json.Unmarshal(data, &info.PackageJSON)
+		if err := json.Unmarshal(data, &info.PackageJSON); err != nil {
+			// Log but continue - malformed package.json shouldn't block analysis
+			log.Printf("Warning: failed to parse package.json: %v", err)
+		}
 	}
 
 	// Walk directory to find files
@@ -202,7 +254,8 @@ Please respond in JSON format with:
 }
 
 func callGemini(apiKey string, prompt string) (string, error) {
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s", apiKey)
+	model := getModel()
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent", model)
 
 	reqBody := map[string]interface{}{
 		"contents": []map[string]interface{}{
@@ -224,39 +277,74 @@ func callGemini(apiKey string, prompt string) (string, error) {
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Post(url, "application/json", bytes.NewBuffer(jsonBody))
-	if err != nil {
-		return "", err
+	var lastErr error
+	backoff := initialBackoff
+
+	// Retry loop with exponential backoff
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			log.Printf("Gemini API retry %d/%d after %v", attempt, maxRetries, backoff)
+			time.Sleep(backoff)
+			// Exponential backoff with cap
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-goog-api-key", apiKey)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue // Retry on connection errors
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Check if retryable status code
+		if isRetryableError(resp.StatusCode) {
+			lastErr = fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+			continue // Retry
+		}
+
+		if resp.StatusCode != 200 {
+			return "", fmt.Errorf("API error: %s", string(body))
+		}
+
+		// Parse response using structured type (safe - no type assertion panics)
+		var result GeminiResponse
+		if err := json.Unmarshal(body, &result); err != nil {
+			return "", fmt.Errorf("failed to parse response: %w", err)
+		}
+
+		// Check for API error in response
+		if result.Error != nil {
+			return "", fmt.Errorf("API error %d: %s", result.Error.Code, result.Error.Message)
+		}
+
+		// Extract text from response
+		if len(result.Candidates) == 0 {
+			return "", fmt.Errorf("no response from API")
+		}
+		if len(result.Candidates[0].Content.Parts) == 0 {
+			return "", fmt.Errorf("no content in API response")
+		}
+
+		return result.Candidates[0].Content.Parts[0].Text, nil
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("API error: %s", string(body))
-	}
-
-	// Parse response
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", err
-	}
-
-	// Extract text from response
-	candidates, ok := result["candidates"].([]interface{})
-	if !ok || len(candidates) == 0 {
-		return "", fmt.Errorf("no response from API")
-	}
-
-	candidate := candidates[0].(map[string]interface{})
-	content := candidate["content"].(map[string]interface{})
-	parts := content["parts"].([]interface{})
-	text := parts[0].(map[string]interface{})["text"].(string)
-
-	return text, nil
+	return "", fmt.Errorf("API request failed after %d retries: %w", maxRetries, lastErr)
 }
 
 func parseGeminiResponse(response string, info *ProjectInfo) *ScanResults {

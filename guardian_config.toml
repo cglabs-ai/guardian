@@ -1,0 +1,49 @@
+# Guardian Configuration
+# Stop AI slop before it hits your codebase.
+
+[project]
+src_root = "src"
+exclude_dirs = ["tests", "__pycache__", "node_modules"]
+
+[limits]
+max_file_lines = 500
+max_function_lines = 50
+
+[limits.custom_file_limits]
+# "some/big/file.py" = 700
+
+[quality]
+ban_print = true
+ban_bare_except = true
+ban_mutable_defaults = true
+ban_star_imports = true
+ban_todo_markers = true
+
+# Mock/fake data detection
+ban_mock_data = true
+mock_patterns = [
+    "mock_", "_mock", "fake_", "_fake", "dummy_", "_dummy",
+    "test_user", "test_email", "test_password",
+    "example@", "@example.com", "@test.com",
+    "placeholder", "sample_", "hardcoded",
+    "changeme", "replace_me", "your_", "xxx",
+    "lorem ipsum", "foo_bar", "asdf",
+]
+
+[security]
+ban_eval_exec = true
+ban_subprocess_shell = true
+ban_dangerous_commands = true
+dangerous_patterns = [
+    "rm -rf",
+    "DROP TABLE",
+    "DROP DATABASE",
+    "DELETE FROM",
+    "TRUNCATE TABLE",
+]
+secret_patterns = [
+    "api_key", "apikey", "api-key",
+    "secret", "password", "passwd",
+    "private_key", "privatekey",
+    "access_token", "auth_token",
+]

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -54,13 +55,6 @@ func runInteractive() {
 }
 
 func runCheck() {
-	fix := false
-	for _, arg := range os.Args[2:] {
-		if arg == "--fix" || arg == "-f" {
-			fix = true
-		}
-	}
-
 	fmt.Println(ui.SmallLogo())
 	fmt.Println()
 
@@ -121,17 +115,22 @@ func runCheck() {
 
 	fmt.Printf("\n%s\n", strings.Join(parts, ui.DimStyle.Render(" · ")))
 
-	if fix {
-		fmt.Println()
-		fmt.Println(ui.Warning("Auto-fix not yet implemented. Use /prompt to generate Claude fixes."))
-	}
-
 	fmt.Println()
 	fmt.Println(ui.DimStyle.Render("Run 'guardian' for interactive mode with /prompt to generate fixes."))
 
 	if critical > 0 {
 		os.Exit(1)
 	}
+}
+
+// Valid languages for guardian add
+var validLanguages = map[string]bool{
+	"python":           true,
+	"python-fastapi":   true,
+	"python-django":    true,
+	"typescript":       true,
+	"typescript-react": true,
+	"go":               true,
 }
 
 func runAdd() {
@@ -149,6 +148,24 @@ func runAdd() {
 	}
 
 	lang := strings.ToLower(os.Args[2])
+
+	// Validate language
+	if !validLanguages[lang] {
+		fmt.Println(ui.Error(fmt.Sprintf("Unknown language: %s", lang)))
+		fmt.Println()
+
+		// Suggest similar languages
+		for valid := range validLanguages {
+			if strings.HasPrefix(valid, lang[:min(3, len(lang))]) {
+				fmt.Printf("Did you mean '%s'?\n", valid)
+				break
+			}
+		}
+
+		fmt.Println()
+		fmt.Println("Run 'guardian add' to see available languages.")
+		os.Exit(1)
+	}
 
 	// Map stack to language
 	language := lang
@@ -186,7 +203,6 @@ func runAdd() {
 }
 
 func runConfig() {
-	// Open config in editor
 	configPath := "guardian_config.toml"
 
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
@@ -196,17 +212,58 @@ func runConfig() {
 		os.Exit(1)
 	}
 
+	// Get and validate editor from environment
 	editor := os.Getenv("EDITOR")
 	if editor == "" {
-		editor = "vim"
+		editor = os.Getenv("VISUAL")
+	}
+
+	// Validate $EDITOR/$VISUAL if set - must be a valid executable
+	if editor != "" {
+		// Extract just the command name (first word, handles "vim -u NONE" etc)
+		parts := strings.Fields(editor)
+		if len(parts) == 0 {
+			editor = ""
+		} else {
+			// Verify the command exists and is executable
+			if _, err := exec.LookPath(parts[0]); err != nil {
+				fmt.Println(ui.Error(fmt.Sprintf("Editor '%s' not found in PATH", parts[0])))
+				fmt.Println()
+				fmt.Println("Set EDITOR to a valid editor (e.g., 'vim', 'nano', 'code').")
+				os.Exit(1)
+			}
+			editor = parts[0] // Use just the command, not flags
+		}
+	}
+
+	if editor == "" {
+		// Try common editors
+		for _, e := range []string{"code", "vim", "nano", "vi"} {
+			if _, err := exec.LookPath(e); err == nil {
+				editor = e
+				break
+			}
+		}
+	}
+	if editor == "" {
+		fmt.Println(ui.Error("No editor found"))
+		fmt.Println()
+		fmt.Println("Set the EDITOR environment variable to your preferred editor.")
+		os.Exit(1)
 	}
 
 	fmt.Printf("Opening %s in %s...\n", configPath, editor)
 
-	// In a real implementation, we'd exec the editor
-	// For now, just print the path
-	fmt.Println()
-	fmt.Println(ui.DimStyle.Render("Edit: " + configPath))
+	// Open editor - use only the validated command name
+	cmd := exec.Command(editor, configPath)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		fmt.Println(ui.Error(fmt.Sprintf("Failed to open editor: %v", err)))
+		os.Exit(1)
+	}
 }
 
 func printHelp() {
@@ -217,7 +274,6 @@ func printHelp() {
 	fmt.Println("Commands:")
 	fmt.Println("  (none)         Launch interactive mode")
 	fmt.Println("  check          Run all checks")
-	fmt.Println("  check --fix    Run checks and auto-fix (coming soon)")
 	fmt.Println("  add <lang>     Add Guardian to project")
 	fmt.Println("  config         Open configuration")
 	fmt.Println("  version        Print version")

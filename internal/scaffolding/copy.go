@@ -21,10 +21,25 @@ type InstallConfig struct {
 
 // Install copies scaffolding files to the target directory
 func Install(config InstallConfig) error {
-	// Create .guardian directory
 	guardianDir := ".guardian"
+
+	// Track if we created the directory (for cleanup on error)
+	createdDir := false
+	if _, err := os.Stat(guardianDir); os.IsNotExist(err) {
+		createdDir = true
+	}
+
+	// Create .guardian directory
 	if err := os.MkdirAll(guardianDir, 0755); err != nil {
 		return fmt.Errorf("failed to create .guardian directory: %w", err)
+	}
+
+	// Cleanup on error - remove partially created files
+	cleanup := func() {
+		if createdDir {
+			os.RemoveAll(guardianDir)
+		}
+		os.Remove("guardian_config.toml")
 	}
 
 	// Copy language-specific files
@@ -32,7 +47,11 @@ func Install(config InstallConfig) error {
 	files, err := scaffoldingFiles.ReadDir(srcDir)
 	if err != nil {
 		// Fall back to generating files in-memory
-		return generateFiles(config)
+		if err := generateFiles(config); err != nil {
+			cleanup()
+			return err
+		}
+		return nil
 	}
 
 	for _, file := range files {
@@ -53,8 +72,42 @@ func Install(config InstallConfig) error {
 		}
 
 		if err := os.WriteFile(destPath, content, 0644); err != nil {
+			cleanup()
 			return fmt.Errorf("failed to write %s: %w", destPath, err)
 		}
+	}
+
+	// Generate config file
+	if err := generateConfig(config); err != nil {
+		cleanup()
+		return err
+	}
+
+	// Generate/update pre-commit config
+	if err := generatePreCommitConfig(config); err != nil {
+		cleanup()
+		return err
+	}
+
+	return nil
+}
+
+// generateFiles generates scaffolding files in-memory (when embeds aren't available)
+func generateFiles(config InstallConfig) error {
+	var err error
+	switch config.Language {
+	case "python":
+		err = generatePythonFiles(config)
+	case "typescript":
+		err = generateTypeScriptFiles(config)
+	case "go":
+		err = generateGoFiles(config)
+	default:
+		err = generatePythonFiles(config) // Default to Python
+	}
+
+	if err != nil {
+		return err
 	}
 
 	// Generate config file
@@ -70,28 +123,19 @@ func Install(config InstallConfig) error {
 	return nil
 }
 
-// generateFiles generates scaffolding files in-memory (when embeds aren't available)
-func generateFiles(config InstallConfig) error {
-	switch config.Language {
-	case "python":
-		return generatePythonFiles(config)
-	case "typescript":
-		return generateTypeScriptFiles(config)
-	case "go":
-		return generateGoFiles(config)
-	default:
-		return generatePythonFiles(config) // Default to Python
-	}
-}
-
 func generatePythonFiles(config InstallConfig) error {
 	files := map[string]string{
-		".guardian/check_file_size.py":     pythonCheckFileSize,
-		".guardian/check_function_size.py": pythonCheckFunctionSize,
-		".guardian/check_dangerous.py":     pythonCheckDangerous,
-		".guardian/check_mock_data.py":     pythonCheckMockData,
-		".guardian/check_security.py":      pythonCheckSecurity,
-		".guardian/guardian.py":            pythonGuardian,
+		".guardian/check_file_size.py":        pythonCheckFileSize,
+		".guardian/check_function_size.py":    pythonCheckFunctionSize,
+		".guardian/check_dangerous.py":        pythonCheckDangerous,
+		".guardian/check_mock_data.py":        pythonCheckMockData,
+		".guardian/check_security.py":         pythonCheckSecurity,
+		".guardian/check_star_imports.py":     pythonCheckStarImports,
+		".guardian/check_mutable_defaults.py": pythonCheckMutableDefaults,
+		".guardian/check_todo_markers.py":     pythonCheckTodoMarkers,
+		".guardian/check_subprocess_shell.py": pythonCheckSubprocessShell,
+		".guardian/check_bare_except.py":      pythonCheckBareExcept,
+		".guardian/guardian.py":               pythonGuardian,
 	}
 
 	for path, content := range files {
@@ -108,12 +152,14 @@ func generatePythonFiles(config InstallConfig) error {
 }
 
 func generateTypeScriptFiles(config InstallConfig) error {
+	// Note: function size check removed - brace counting doesn't work for arrow functions,
+	// class methods, or functions with object literals. Needs proper AST parsing.
 	files := map[string]string{
-		".guardian/check_file_size.js":     tsCheckFileSize,
-		".guardian/check_function_size.js": tsCheckFunctionSize,
-		".guardian/check_dangerous.js":     tsCheckDangerous,
-		".guardian/check_mock_data.js":     tsCheckMockData,
-		".guardian/guardian.js":            tsGuardian,
+		".guardian/check_file_size.js":   tsCheckFileSize,
+		".guardian/check_dangerous.js":   tsCheckDangerous,
+		".guardian/check_mock_data.js":   tsCheckMockData,
+		".guardian/check_console_log.js": tsCheckConsoleLog,
+		".guardian/guardian.js":          tsGuardian,
 	}
 
 	for path, content := range files {
@@ -268,6 +314,31 @@ func generatePreCommitConfig(config InstallConfig) error {
         entry: python .guardian/check_security.py
         language: python
         types: [python]
+      - id: guardian-star-imports
+        name: Check star imports
+        entry: python .guardian/check_star_imports.py
+        language: python
+        types: [python]
+      - id: guardian-mutable-defaults
+        name: Check mutable defaults
+        entry: python .guardian/check_mutable_defaults.py
+        language: python
+        types: [python]
+      - id: guardian-todo-markers
+        name: Check TODO markers
+        entry: python .guardian/check_todo_markers.py
+        language: python
+        types: [python]
+      - id: guardian-subprocess-shell
+        name: Check subprocess shell
+        entry: python .guardian/check_subprocess_shell.py
+        language: python
+        types: [python]
+      - id: guardian-bare-except
+        name: Check bare except
+        entry: python .guardian/check_bare_except.py
+        language: python
+        types: [python]
 `
 	case "typescript":
 		guardianHook = `
@@ -296,8 +367,8 @@ func generatePreCommitConfig(config InstallConfig) error {
 		return os.WriteFile(".pre-commit-config.yaml", []byte(content), 0644)
 	}
 
-	// Append to existing
-	newContent := existingContent + guardianHook
+	// Append to existing - ensure newline before our hooks
+	newContent := strings.TrimRight(existingContent, "\n") + "\n" + guardianHook
 	return os.WriteFile(".pre-commit-config.yaml", []byte(newContent), 0644)
 }
 
@@ -465,11 +536,36 @@ if __name__ == "__main__":
 `
 
 const pythonCheckSecurity = `#!/usr/bin/env python3
-"""Check for security issues."""
+"""Check for security issues using AST parsing."""
 
+import ast
 import re
 import sys
 from pathlib import Path
+
+def check_eval_exec(tree, filepath):
+    """Check for eval/exec calls using AST - no false positives from strings."""
+    issues = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            # Check for eval() or exec() calls
+            if isinstance(node.func, ast.Name) and node.func.id in ("eval", "exec"):
+                issues.append(f"{filepath}:{node.lineno} [ban-eval] Avoid {node.func.id}() - security risk")
+    return issues
+
+def check_subprocess_shell(tree, filepath):
+    """Check for subprocess with shell=True using AST."""
+    issues = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            # Check for subprocess.* calls
+            if isinstance(node.func, ast.Attribute):
+                if isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess":
+                    for kw in node.keywords:
+                        if kw.arg == "shell":
+                            if isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                                issues.append(f"{filepath}:{node.lineno} [subprocess-shell] Avoid shell=True - security risk")
+    return issues
 
 def main() -> int:
     if len(sys.argv) < 2:
@@ -482,37 +578,49 @@ def main() -> int:
             continue
 
         content = path.read_text()
+
+        # Parse AST for accurate detection
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            continue
+
+        # AST-based checks (no false positives)
+        for issue in check_eval_exec(tree, filepath):
+            print(issue)
+            failed = True
+
+        for issue in check_subprocess_shell(tree, filepath):
+            print(issue)
+            failed = True
+
+        # Line-based checks for patterns that can't use AST
         for i, line in enumerate(content.splitlines(), 1):
             # Skip comments
-            if line.strip().startswith("#"):
+            stripped = line.strip()
+            if stripped.startswith("#"):
                 continue
 
-            # eval/exec
-            if "eval(" in line or "exec(" in line:
-                print(f"{filepath}:{i} [ban-eval] Avoid eval()/exec() - security risk")
-                failed = True
+            # Skip if line is inside a string (basic heuristic)
+            quote_count = line.count('"') + line.count("'")
 
-            # shell=True
-            if "shell=True" in line:
-                print(f"{filepath}:{i} [subprocess-shell] Avoid shell=True - security risk")
-                failed = True
-
-            # SQL injection
-            if re.search(r'f["\']SELECT|f["\']INSERT|f["\']UPDATE|f["\']DELETE', line):
+            # SQL injection - catch f-strings with SQL keywords
+            if re.search(r'f["\'](?:SELECT|INSERT|UPDATE|DELETE)', line, re.IGNORECASE):
                 print(f"{filepath}:{i} [sql-injection] f-string in SQL query - use parameterized queries")
                 failed = True
 
-            # Hardcoded secrets
-            secret_patterns = [
-                r'api_key\s*=\s*["\'][^"\']+["\']',
-                r'password\s*=\s*["\'][^"\']+["\']',
-                r'secret\s*=\s*["\'][^"\']+["\']',
-            ]
-            for pattern in secret_patterns:
-                if re.search(pattern, line, re.IGNORECASE):
-                    print(f"{filepath}:{i} [secret-pattern] Possible hardcoded secret - use environment variables")
-                    failed = True
-                    break
+            # Hardcoded secrets - only if it looks like an assignment, not in a string
+            if "=" in line and quote_count <= 2:
+                secret_patterns = [
+                    r'^[^#]*\bapi_key\s*=\s*["\'][^"\']+["\']',
+                    r'^[^#]*\bpassword\s*=\s*["\'][^"\']+["\']',
+                    r'^[^#]*\bsecret\s*=\s*["\'][^"\']+["\']',
+                ]
+                for pattern in secret_patterns:
+                    if re.search(pattern, line, re.IGNORECASE):
+                        print(f"{filepath}:{i} [secret-pattern] Possible hardcoded secret - use environment variables")
+                        failed = True
+                        break
 
     return 1 if failed else 0
 
@@ -533,6 +641,11 @@ CHECKS = [
     "check_dangerous.py",
     "check_mock_data.py",
     "check_security.py",
+    "check_star_imports.py",
+    "check_mutable_defaults.py",
+    "check_todo_markers.py",
+    "check_subprocess_shell.py",
+    "check_bare_except.py",
 ]
 
 def main() -> int:
@@ -759,6 +872,46 @@ function main() {
 main();
 `
 
+const tsCheckConsoleLog = `#!/usr/bin/env node
+/**
+ * Check for console.log statements in production code.
+ */
+
+const fs = require('fs');
+
+function main() {
+    const files = process.argv.slice(2);
+    if (files.length === 0) process.exit(0);
+
+    let failed = false;
+
+    for (const filepath of files) {
+        if (!fs.existsSync(filepath)) continue;
+
+        // Skip test files
+        if (filepath.includes('test') || filepath.includes('spec')) continue;
+
+        const content = fs.readFileSync(filepath, 'utf8');
+        const lines = content.split('\n');
+
+        lines.forEach((line, idx) => {
+            // Skip comments
+            const trimmed = line.trim();
+            if (trimmed.startsWith('//') || trimmed.startsWith('/*')) return;
+
+            if (line.includes('console.log(')) {
+                console.log(` + "`${filepath}:${idx + 1} [ban-console] Remove console.log() - use proper logging`" + `);
+                failed = true;
+            }
+        });
+    }
+
+    process.exit(failed ? 1 : 0);
+}
+
+main();
+`
+
 const tsGuardian = `#!/usr/bin/env node
 /**
  * Guardian - Main entry point for all checks.
@@ -770,9 +923,9 @@ const path = require('path');
 
 const CHECKS = [
     'check_file_size.js',
-    'check_function_size.js',
     'check_dangerous.js',
     'check_mock_data.js',
+    'check_console_log.js',
 ];
 
 function main() {
@@ -837,10 +990,181 @@ if command -v staticcheck &> /dev/null; then
     staticcheck ./...
 fi
 
-# Check for dangerous patterns
-grep -rn "os.Remove\|os.RemoveAll\|exec.Command" --include="*.go" . && {
+# Check for dangerous patterns (|| true prevents exit on no matches)
+if grep -rn "os.Remove\|os.RemoveAll\|exec.Command" --include="*.go" . 2>/dev/null; then
     echo "Warning: Dangerous file operations detected"
-}
+fi
 
 echo "Guardian checks complete"
+`
+
+// Additional Python checks
+
+const pythonCheckStarImports = `#!/usr/bin/env python3
+"""Check for star imports (from x import *)."""
+
+import re
+import sys
+from pathlib import Path
+
+STAR_IMPORT_PATTERN = re.compile(r'^\s*from\s+\w+(?:\.\w+)*\s+import\s+\*')
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        return 0
+
+    failed = False
+    for filepath in sys.argv[1:]:
+        path = Path(filepath)
+        if not path.exists() or path.suffix != ".py":
+            continue
+
+        content = path.read_text()
+        for i, line in enumerate(content.splitlines(), 1):
+            if STAR_IMPORT_PATTERN.match(line):
+                print(f"{filepath}:{i} [ban-star] Avoid 'from x import *' - pollutes namespace")
+                failed = True
+
+    return 1 if failed else 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+`
+
+const pythonCheckMutableDefaults = `#!/usr/bin/env python3
+"""Check for mutable default arguments."""
+
+import ast
+import sys
+from pathlib import Path
+
+MUTABLE_TYPES = (ast.List, ast.Dict, ast.Set)
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        return 0
+
+    failed = False
+    for filepath in sys.argv[1:]:
+        path = Path(filepath)
+        if not path.exists() or path.suffix != ".py":
+            continue
+
+        try:
+            tree = ast.parse(path.read_text())
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for default in node.args.defaults + node.args.kw_defaults:
+                    if default and isinstance(default, MUTABLE_TYPES):
+                        print(f"{filepath}:{node.lineno} [mutable-default] {node.name}() has mutable default argument - use None instead")
+                        failed = True
+                        break
+
+    return 1 if failed else 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+`
+
+const pythonCheckTodoMarkers = `#!/usr/bin/env python3
+"""Check for TODO, FIXME, HACK markers."""
+
+import re
+import sys
+from pathlib import Path
+
+TODO_PATTERN = re.compile(r'#\s*(TODO|FIXME|HACK|XXX)\b', re.IGNORECASE)
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        return 0
+
+    failed = False
+    for filepath in sys.argv[1:]:
+        path = Path(filepath)
+        if not path.exists() or path.suffix != ".py":
+            continue
+
+        content = path.read_text()
+        for i, line in enumerate(content.splitlines(), 1):
+            match = TODO_PATTERN.search(line)
+            if match:
+                marker = match.group(1).upper()
+                print(f"{filepath}:{i} [todo-marker] {marker} found - address before committing")
+                failed = True
+
+    return 1 if failed else 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+`
+
+const pythonCheckSubprocessShell = `#!/usr/bin/env python3
+"""Check for subprocess with shell=True."""
+
+import re
+import sys
+from pathlib import Path
+
+SHELL_TRUE_PATTERN = re.compile(r'subprocess\.\w+\([^)]*shell\s*=\s*True')
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        return 0
+
+    failed = False
+    for filepath in sys.argv[1:]:
+        path = Path(filepath)
+        if not path.exists() or path.suffix != ".py":
+            continue
+
+        content = path.read_text()
+        for i, line in enumerate(content.splitlines(), 1):
+            # Skip comments
+            if line.strip().startswith("#"):
+                continue
+
+            if SHELL_TRUE_PATTERN.search(line):
+                print(f"{filepath}:{i} [subprocess-shell] Avoid shell=True - command injection risk")
+                failed = True
+
+    return 1 if failed else 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+`
+
+const pythonCheckBareExcept = `#!/usr/bin/env python3
+"""Check for bare except clauses."""
+
+import re
+import sys
+from pathlib import Path
+
+# Matches "except:" without any exception type
+BARE_EXCEPT_PATTERN = re.compile(r'^\s*except\s*:\s*(#.*)?$')
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        return 0
+
+    failed = False
+    for filepath in sys.argv[1:]:
+        path = Path(filepath)
+        if not path.exists() or path.suffix != ".py":
+            continue
+
+        content = path.read_text()
+        for i, line in enumerate(content.splitlines(), 1):
+            if BARE_EXCEPT_PATTERN.match(line):
+                print(f"{filepath}:{i} [ban-except] Avoid bare 'except:' - catch specific exceptions")
+                failed = True
+
+    return 1 if failed else 0
+
+if __name__ == "__main__":
+    sys.exit(main())
 `

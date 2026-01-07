@@ -2,6 +2,8 @@ package screens
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/atotto/clipboard"
@@ -33,12 +35,17 @@ type InteractiveModel struct {
 	helpCursor   int
 	promptCursor int
 	promptText   string
-	explainIdx   int
-	dryRunInfo   *checks.DryRunInfo
-	data         interface{}
+	explainIdx int
+	dryRunInfo *checks.DryRunInfo
+	lastError  string // Stores last error message for display
+	// NOTE: QuickStart config (excludeDirs, sourceDir) not yet passed to checks.
+	// Currently uses hardcoded defaults. Enhancement for v1.1.
 }
 
 func NewInteractive(data interface{}) InteractiveModel {
+	// data parameter kept for API compatibility but not currently used
+	_ = data
+
 	input := textinput.New()
 	input.Placeholder = "type a command..."
 	input.Focus()
@@ -48,7 +55,6 @@ func NewInteractive(data interface{}) InteractiveModel {
 	return InteractiveModel{
 		mode:  ModeCommand,
 		input: input,
-		data:  data,
 	}
 }
 
@@ -91,6 +97,13 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mode = ModePromptResult
 		clipboard.WriteAll(msg.prompt)
 		return m, nil
+
+	case configOpenedMsg:
+		// Config editor closed - capture error for display
+		if msg.err != nil {
+			m.lastError = msg.err.Error()
+		}
+		return m, nil
 	}
 
 	return m, nil
@@ -112,6 +125,8 @@ func (m InteractiveModel) updateCommand(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m InteractiveModel) handleCommand(cmd string) (tea.Model, tea.Cmd) {
+	// Clear any previous error when user enters a new command
+	m.lastError = ""
 	switch strings.ToLower(cmd) {
 	case "/run", "run":
 		return m, runChecks()
@@ -316,6 +331,13 @@ func (m InteractiveModel) viewCommand() string {
 	}
 
 	s.WriteString("\n")
+
+	// Display last error if any
+	if m.lastError != "" {
+		s.WriteString(ui.Error(m.lastError))
+		s.WriteString("\n\n")
+	}
+
 	s.WriteString(ui.CursorStyle.Render("  › "))
 	s.WriteString(m.input.View())
 	s.WriteString("\n")
@@ -648,9 +670,59 @@ func generatePromptForIssue(issue checks.Issue) tea.Cmd {
 	}
 }
 
+type configOpenedMsg struct {
+	err error
+}
+
 func openConfig() tea.Cmd {
 	return func() tea.Msg {
-		// TODO: Open config in editor
-		return nil
+		configPath := "guardian_config.toml"
+
+		// Check if config exists
+		if _, err := os.Stat(configPath); os.IsNotExist(err) {
+			return configOpenedMsg{err: fmt.Errorf("no guardian_config.toml found - run 'guardian add <language>' first")}
+		}
+
+		// Get editor from environment
+		editor := os.Getenv("EDITOR")
+		if editor == "" {
+			editor = os.Getenv("VISUAL")
+		}
+		if editor == "" {
+			// Try common editors
+			for _, e := range []string{"code", "vim", "nano", "vi"} {
+				if _, err := exec.LookPath(e); err == nil {
+					editor = e
+					break
+				}
+			}
+		}
+		if editor == "" {
+			return configOpenedMsg{err: fmt.Errorf("no editor found - set EDITOR environment variable")}
+		}
+
+		// Validate editor to prevent command injection
+		// Split to handle editors with arguments like "code --wait"
+		editorParts := strings.Fields(editor)
+		if len(editorParts) == 0 {
+			return configOpenedMsg{err: fmt.Errorf("invalid EDITOR value")}
+		}
+		editorBin := editorParts[0]
+
+		// Verify the editor binary exists and is executable
+		editorPath, err := exec.LookPath(editorBin)
+		if err != nil {
+			return configOpenedMsg{err: fmt.Errorf("editor '%s' not found in PATH", editorBin)}
+		}
+
+		// Build command with validated editor
+		args := append(editorParts[1:], configPath)
+		cmd := exec.Command(editorPath, args...)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		err = cmd.Run()
+
+		return configOpenedMsg{err: err}
 	}
 }

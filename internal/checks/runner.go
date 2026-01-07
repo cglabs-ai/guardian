@@ -10,6 +10,66 @@ import (
 	"strings"
 )
 
+// Pre-compiled regexes for performance (compiled once at package init)
+var (
+	// Mock data patterns
+	mockPatternRegexes = []*regexp.Regexp{
+		regexp.MustCompile(`test@example\.com`),
+		regexp.MustCompile(`example@`),
+		regexp.MustCompile(`@test\.com`),
+		regexp.MustCompile(`fake_`),
+		regexp.MustCompile(`_fake`),
+		regexp.MustCompile(`mock_`),
+		regexp.MustCompile(`_mock`),
+		regexp.MustCompile(`dummy_`),
+		regexp.MustCompile(`placeholder`),
+		regexp.MustCompile(`test_user`),
+		regexp.MustCompile(`test_password`),
+		regexp.MustCompile(`changeme`),
+		regexp.MustCompile(`your_.*_here`),
+	}
+
+	// Code pattern regexes
+	printRe     = regexp.MustCompile(`\bprint\s*\(`)
+	bareExceptRe = regexp.MustCompile(`except\s*:`)
+	evalRe      = regexp.MustCompile(`(?:^|[=(:,\s])eval\s*\(`)
+	execRe      = regexp.MustCompile(`(?:^|[=(:,\s])exec\s*\(`)
+	starImportRe = regexp.MustCompile(`from\s+\S+\s+import\s+\*`)
+	sqlInjectionRe = regexp.MustCompile(`(?i)f["'](?:SELECT|INSERT|UPDATE|DELETE)`)
+
+	// Dangerous command patterns
+	dangerousPatternRegexes = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)rm\s+-rf`),
+		regexp.MustCompile(`(?i)DROP\s+TABLE`),
+		regexp.MustCompile(`(?i)DROP\s+DATABASE`),
+		regexp.MustCompile(`(?i)DELETE\s+FROM\s+\w+\s*;`),
+		regexp.MustCompile(`(?i)TRUNCATE\s+TABLE`),
+	}
+
+	// Secret patterns
+	secretPatternRegexes = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)api_key\s*=\s*["'][^"']+["']`),
+		regexp.MustCompile(`(?i)password\s*=\s*["'][^"']+["']`),
+		regexp.MustCompile(`(?i)secret\s*=\s*["'][^"']+["']`),
+		regexp.MustCompile(`(?i)AWS_SECRET`),
+		regexp.MustCompile(`(?i)PRIVATE_KEY`),
+	}
+
+	// Output parsing regexes
+	issueFormatRe = regexp.MustCompile(`^(.+):(\d+)\s+\[([^\]]+)\]\s+(.+)$`)
+	failFormatRe  = regexp.MustCompile(`^FAIL\s+(.+):(\d+)\s+-\s+([^:]+):\s+(.+)$`)
+
+	// Shared exclusion list for directory skipping (used by both RunAll and DryRun)
+	excludedDirs = map[string]bool{
+		".git":        true,
+		"node_modules": true,
+		"__pycache__":  true,
+		".venv":        true,
+		"venv":         true,
+		".guardian":    true,
+	}
+)
+
 // Issue represents a single code issue
 type Issue struct {
 	File     string
@@ -48,7 +108,14 @@ func RunAll(dir string) []Issue {
 	// Run the guardian.py script
 	cmd := exec.Command("python3", guardianPath)
 	cmd.Dir = dir
-	output, _ := cmd.CombinedOutput()
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		// Python script failed - fall back to builtin checks
+		// This handles: python3 not installed, script errors, etc.
+		issues = append(issues, runBuiltinChecks(dir)...)
+		return issues
+	}
 
 	// Parse output
 	issues = append(issues, parseGuardianOutput(string(output))...)
@@ -66,11 +133,9 @@ func runBuiltinChecks(dir string) []Issue {
 			return nil
 		}
 
-		// Skip excluded directories
+		// Skip excluded directories (using shared exclusion list)
 		if info.IsDir() {
-			name := info.Name()
-			if name == ".git" || name == "node_modules" || name == "__pycache__" ||
-				name == ".venv" || name == "venv" || name == ".guardian" {
+			if excludedDirs[info.Name()] {
 				return filepath.SkipDir
 			}
 			return nil
@@ -102,42 +167,65 @@ func checkFile(path string) []Issue {
 	}
 
 	lines := strings.Split(string(content), "\n")
+	// Fix off-by-one: if file ends with newline, Split adds empty element
+	// A 500-line file with trailing newline has 501 elements but is still 500 lines
+	lineCount := len(lines)
+	if lineCount > 0 && lines[lineCount-1] == "" {
+		lineCount--
+	}
 	relPath := path
 
 	// File size check
-	if len(lines) > 500 {
+	if lineCount > 500 {
 		issues = append(issues, Issue{
 			File:     relPath,
 			Line:     1,
 			Rule:     "file-size",
-			Message:  "File has " + strconv.Itoa(len(lines)) + " lines (max 500)",
+			Message:  "File has " + strconv.Itoa(lineCount) + " lines (max 500)",
 			Severity: "warning",
 		})
 	}
 
+	// Track docstring state for multi-line strings
+	inDocstring := false
+	docstringDelim := ""
+
 	// Line-by-line checks
 	for i, line := range lines {
 		lineNum := i + 1
+		trimmed := strings.TrimSpace(line)
 
-		// Mock data patterns
-		mockPatterns := []string{
-			`test@example\.com`,
-			`example@`,
-			`@test\.com`,
-			`fake_`,
-			`_fake`,
-			`mock_`,
-			`_mock`,
-			`dummy_`,
-			`placeholder`,
-			`test_user`,
-			`test_password`,
-			`changeme`,
-			`your_.*_here`,
+		// Skip empty lines
+		if trimmed == "" {
+			continue
 		}
 
-		for _, pattern := range mockPatterns {
-			if matched, _ := regexp.MatchString(pattern, strings.ToLower(line)); matched {
+		// Track multi-line docstrings (Python)
+		if !inDocstring {
+			if strings.HasPrefix(trimmed, `"""`) || strings.HasPrefix(trimmed, `'''`) {
+				docstringDelim = trimmed[:3]
+				// Check if docstring ends on same line
+				rest := trimmed[3:]
+				if !strings.Contains(rest, docstringDelim) {
+					inDocstring = true
+				}
+				continue // Skip docstring start line
+			}
+		} else {
+			// Inside docstring - check for end
+			if strings.Contains(trimmed, docstringDelim) {
+				inDocstring = false
+			}
+			continue // Skip all docstring content
+		}
+
+		// Skip comment lines (Python #, JS/TS //)
+		isComment := strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "//")
+
+		// Mock data patterns (using pre-compiled regexes)
+		lowerLine := strings.ToLower(line)
+		for _, re := range mockPatternRegexes {
+			if re.MatchString(lowerLine) {
 				issues = append(issues, Issue{
 					File:     relPath,
 					Line:     lineNum,
@@ -149,8 +237,8 @@ func checkFile(path string) []Issue {
 			}
 		}
 
-		// Print statements (Python)
-		if strings.Contains(line, "print(") && !strings.HasPrefix(strings.TrimSpace(line), "#") {
+		// Print statements (Python) - use word boundary to avoid "blueprint", "fingerprint"
+		if !isComment && printRe.MatchString(line) {
 			issues = append(issues, Issue{
 				File:     relPath,
 				Line:     lineNum,
@@ -161,7 +249,7 @@ func checkFile(path string) []Issue {
 		}
 
 		// Console.log (JS/TS)
-		if strings.Contains(line, "console.log(") && !strings.HasPrefix(strings.TrimSpace(line), "//") {
+		if !isComment && strings.Contains(line, "console.log(") {
 			issues = append(issues, Issue{
 				File:     relPath,
 				Line:     lineNum,
@@ -172,7 +260,7 @@ func checkFile(path string) []Issue {
 		}
 
 		// Bare except (Python)
-		if matched, _ := regexp.MatchString(`except\s*:`, line); matched {
+		if !isComment && bareExceptRe.MatchString(line) {
 			issues = append(issues, Issue{
 				File:     relPath,
 				Line:     lineNum,
@@ -182,19 +270,49 @@ func checkFile(path string) []Issue {
 			})
 		}
 
-		// eval/exec
-		if strings.Contains(line, "eval(") || strings.Contains(line, "exec(") {
-			issues = append(issues, Issue{
-				File:     relPath,
-				Line:     lineNum,
-				Rule:     "ban-eval",
-				Message:  "Avoid eval()/exec() - security risk",
-				Severity: "critical",
-			})
+		// eval/exec - only flag actual function calls, not strings/comments
+		if !isComment {
+			// Only match if eval/exec is preceded by = ( , : or start of line
+			// This avoids matching "eval(" inside strings like "don't use eval()"
+			if evalRe.MatchString(trimmed) {
+				// Check if inside a string by counting unescaped quotes before eval
+				beforeEval := strings.Split(line, "eval")[0]
+				// Count only unescaped quotes by removing escaped ones first
+				cleaned := strings.ReplaceAll(beforeEval, `\"`, "")
+				cleaned = strings.ReplaceAll(cleaned, `\'`, "")
+				doubleQuotes := strings.Count(cleaned, `"`)
+				singleQuotes := strings.Count(cleaned, `'`)
+				// If either quote type is odd, we're inside a string
+				if doubleQuotes%2 == 0 && singleQuotes%2 == 0 {
+					issues = append(issues, Issue{
+						File:     relPath,
+						Line:     lineNum,
+						Rule:     "ban-eval",
+						Message:  "Avoid eval() - security risk",
+						Severity: "critical",
+					})
+				}
+			}
+			if execRe.MatchString(trimmed) {
+				beforeExec := strings.Split(line, "exec")[0]
+				cleaned := strings.ReplaceAll(beforeExec, `\"`, "")
+				cleaned = strings.ReplaceAll(cleaned, `\'`, "")
+				doubleQuotes := strings.Count(cleaned, `"`)
+				singleQuotes := strings.Count(cleaned, `'`)
+				if doubleQuotes%2 == 0 && singleQuotes%2 == 0 {
+					issues = append(issues, Issue{
+						File:     relPath,
+						Line:     lineNum,
+						Rule:     "ban-eval",
+						Message:  "Avoid exec() - security risk",
+						Severity: "critical",
+					})
+				}
+			}
 		}
 
 		// Star imports
-		if matched, _ := regexp.MatchString(`from\s+\S+\s+import\s+\*`, line); matched {
+		if !isComment && starImportRe.MatchString(line) {
 			issues = append(issues, Issue{
 				File:     relPath,
 				Line:     lineNum,
@@ -216,55 +334,40 @@ func checkFile(path string) []Issue {
 			})
 		}
 
-		// Dangerous commands
-		dangerousPatterns := []string{
-			`rm\s+-rf`,
-			`DROP\s+TABLE`,
-			`DROP\s+DATABASE`,
-			`DELETE\s+FROM\s+\w+\s*;`,
-			`TRUNCATE\s+TABLE`,
-		}
-
-		for _, pattern := range dangerousPatterns {
-			if matched, _ := regexp.MatchString("(?i)"+pattern, line); matched {
-				issues = append(issues, Issue{
-					File:     relPath,
-					Line:     lineNum,
-					Rule:     "dangerous-cmd",
-					Message:  "Dangerous command detected - review carefully",
-					Severity: "critical",
-				})
-				break
+		// Dangerous commands (using pre-compiled regexes)
+		if !isComment {
+			for _, re := range dangerousPatternRegexes {
+				if re.MatchString(line) {
+					issues = append(issues, Issue{
+						File:     relPath,
+						Line:     lineNum,
+						Rule:     "dangerous-cmd",
+						Message:  "Dangerous command detected - review carefully",
+						Severity: "critical",
+					})
+					break
+				}
 			}
 		}
 
-		// Secret patterns
-		secretPatterns := []string{
-			`api_key\s*=\s*["'][^"']+["']`,
-			`password\s*=\s*["'][^"']+["']`,
-			`secret\s*=\s*["'][^"']+["']`,
-			`AWS_SECRET`,
-			`PRIVATE_KEY`,
-		}
-
-		for _, pattern := range secretPatterns {
-			if matched, _ := regexp.MatchString("(?i)"+pattern, line); matched {
-				issues = append(issues, Issue{
-					File:     relPath,
-					Line:     lineNum,
-					Rule:     "secret-pattern",
-					Message:  "Possible hardcoded secret - use environment variables",
-					Severity: "critical",
-				})
-				break
+		// Secret patterns (using pre-compiled regexes)
+		if !isComment {
+			for _, re := range secretPatternRegexes {
+				if re.MatchString(line) {
+					issues = append(issues, Issue{
+						File:     relPath,
+						Line:     lineNum,
+						Rule:     "secret-pattern",
+						Message:  "Possible hardcoded secret - use environment variables",
+						Severity: "critical",
+					})
+					break
+				}
 			}
 		}
 
-		// SQL injection (f-strings in queries)
-		if strings.Contains(line, "f\"SELECT") || strings.Contains(line, "f'SELECT") ||
-			strings.Contains(line, "f\"INSERT") || strings.Contains(line, "f'INSERT") ||
-			strings.Contains(line, "f\"UPDATE") || strings.Contains(line, "f'UPDATE") ||
-			strings.Contains(line, "f\"DELETE") || strings.Contains(line, "f'DELETE") {
+		// SQL injection (f-strings in queries) - case insensitive
+		if !isComment && sqlInjectionRe.MatchString(line) {
 			issues = append(issues, Issue{
 				File:     relPath,
 				Line:     lineNum,
@@ -275,7 +378,7 @@ func checkFile(path string) []Issue {
 		}
 
 		// subprocess with shell=True
-		if strings.Contains(line, "shell=True") {
+		if !isComment && strings.Contains(line, "shell=True") {
 			issues = append(issues, Issue{
 				File:     relPath,
 				Line:     lineNum,
@@ -311,9 +414,8 @@ func parseGuardianOutput(output string) []Issue {
 }
 
 func parseIssueLine(line string) Issue {
-	// Try format: "file.py:45 [rule] message"
-	re := regexp.MustCompile(`^(.+):(\d+)\s+\[([^\]]+)\]\s+(.+)$`)
-	matches := re.FindStringSubmatch(line)
+	// Try format: "file.py:45 [rule] message" (using pre-compiled regex)
+	matches := issueFormatRe.FindStringSubmatch(line)
 
 	if len(matches) == 5 {
 		lineNum, _ := strconv.Atoi(matches[2])
@@ -326,9 +428,8 @@ func parseIssueLine(line string) Issue {
 		}
 	}
 
-	// Try format: "FAIL file.py:45 - rule: message"
-	re2 := regexp.MustCompile(`^FAIL\s+(.+):(\d+)\s+-\s+([^:]+):\s+(.+)$`)
-	matches2 := re2.FindStringSubmatch(line)
+	// Try format: "FAIL file.py:45 - rule: message" (using pre-compiled regex)
+	matches2 := failFormatRe.FindStringSubmatch(line)
 
 	if len(matches2) == 5 {
 		lineNum, _ := strconv.Atoi(matches2[2])
@@ -375,27 +476,23 @@ func DryRun(dir string) *DryRunInfo {
 		Excluded: []string{},
 	}
 
-	// Common exclusions
-	exclusions := []string{".git", "node_modules", "__pycache__", ".venv", "venv", "tests", "test"}
-
 	filepath.Walk(dir, func(path string, fileInfo os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
 
+		// Use shared exclusion list (same as runBuiltinChecks)
 		if fileInfo.IsDir() {
-			name := fileInfo.Name()
-			for _, excl := range exclusions {
-				if name == excl {
-					info.Excluded = append(info.Excluded, name+"/")
-					return filepath.SkipDir
-				}
+			if excludedDirs[fileInfo.Name()] {
+				info.Excluded = append(info.Excluded, fileInfo.Name()+"/")
+				return filepath.SkipDir
 			}
 			return nil
 		}
 
 		ext := filepath.Ext(path)
-		if ext != ".py" && ext != ".js" && ext != ".ts" && ext != ".tsx" && ext != ".go" {
+		// Match the same file types as runBuiltinChecks
+		if ext != ".py" && ext != ".js" && ext != ".ts" && ext != ".tsx" {
 			return nil
 		}
 
@@ -404,16 +501,21 @@ func DryRun(dir string) *DryRunInfo {
 			return nil
 		}
 
-		lines := len(strings.Split(string(content), "\n"))
+		// Fix off-by-one: consistent with checkFile line counting
+		lines := strings.Split(string(content), "\n")
+		lineCount := len(lines)
+		if lineCount > 0 && lines[lineCount-1] == "" {
+			lineCount--
+		}
 
 		relPath, _ := filepath.Rel(dir, path)
 		info.Files = append(info.Files, FileInfo{
 			Path:  relPath,
-			Lines: lines,
+			Lines: lineCount,
 		})
 
 		info.FileCount++
-		info.TotalLines += lines
+		info.TotalLines += lineCount
 
 		return nil
 	})

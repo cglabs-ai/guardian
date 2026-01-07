@@ -1,0 +1,7 @@
+repos:
+  - repo: local
+    hooks:
+      - id: guardian
+        name: Guardian checks
+        entry: .guardian/guardian.sh
+        language: script

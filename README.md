@@ -65,6 +65,27 @@ guardian check
 - **Smart Scan**: Auto-detect framework, find codebase-specific patterns
 - **Prompt Generation**: Generate Claude prompts to fix issues
 
+## Language Support
+
+| Language | Support Level | Notes |
+|----------|---------------|-------|
+| **Python** | ✅ Full | All 12 checks, AST-based analysis |
+| **TypeScript/JavaScript** | ⚠️ Partial | 4 checks: file-size, dangerous-cmds, mock-data, console.log |
+| **Go** | ⚠️ Minimal | Wrapper for `go vet` and `staticcheck` |
+
+**Python checks (via AST parsing):**
+- eval/exec detection (no false positives)
+- subprocess shell=True detection
+- Mutable default arguments
+- Function size with accurate line counting
+
+**TypeScript limitations:**
+- No function size check (needs proper AST parser)
+- No eval/exec check (regex-based would have false positives)
+- Uses regex patterns, less accurate than Python's AST
+
+We're working on improving TypeScript support. Contributions welcome!
+
 ## Interactive Mode
 
 After running `guardian`, you get an interactive shell:

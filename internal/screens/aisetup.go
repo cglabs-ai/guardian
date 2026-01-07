@@ -3,6 +3,7 @@ package screens
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -224,6 +225,9 @@ func (m AISetupModel) viewKey() string {
 	s.WriteString(ui.SubtitleStyle.Render("ai.google.dev/gemini-api"))
 	s.WriteString("\n\n")
 
+	s.WriteString(ui.DimStyle.Render("    ⚠ Key stored in ~/.guardian/credentials (plaintext)"))
+	s.WriteString("\n\n")
+
 	s.WriteString(ui.DimStyle.Render("  enter continue · esc back"))
 
 	return s.String()
@@ -247,6 +251,8 @@ func (m AISetupModel) viewMenu() string {
 	s.WriteString("\n\n")
 
 	s.WriteString(ui.Success("Key valid. Saved to ~/.guardian/credentials"))
+	s.WriteString("\n")
+	s.WriteString(ui.DimStyle.Render("  ⚠ Stored in plaintext. Use a restricted API key."))
 	s.WriteString("\n\n")
 
 	s.WriteString(ui.NormalStyle.Render("  AI features enabled:"))
@@ -341,7 +347,7 @@ func (m AISetupModel) viewResults() string {
 
 	// Secrets found
 	if len(m.scanResults.SecretsFound) > 0 {
-		s.WriteString(ui.WarningStyle.Render("    Secrets:      Found " + string(rune(len(m.scanResults.SecretsFound))) + " possible exposed keys"))
+		s.WriteString(ui.WarningStyle.Render("    Secrets:      Found " + strconv.Itoa(len(m.scanResults.SecretsFound)) + " possible exposed keys"))
 		s.WriteString("\n")
 	}
 	s.WriteString("\n")
