@@ -131,6 +131,8 @@ var validLanguages = map[string]bool{
 	"typescript":       true,
 	"typescript-react": true,
 	"go":               true,
+	"php":              true,
+	"php-laravel":      true,
 }
 
 func runAdd() {
@@ -144,6 +146,8 @@ func runAdd() {
 		fmt.Println("  typescript      TypeScript project")
 		fmt.Println("  typescript-react TypeScript + React")
 		fmt.Println("  go              Go project")
+		fmt.Println("  php             PHP project")
+		fmt.Println("  php-laravel     PHP + Laravel")
 		os.Exit(1)
 	}
 

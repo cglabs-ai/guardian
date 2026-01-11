@@ -102,6 +102,8 @@ func generateFiles(config InstallConfig) error {
 		err = generateTypeScriptFiles(config)
 	case "go":
 		err = generateGoFiles(config)
+	case "php":
+		err = generatePhpFiles(config)
 	default:
 		err = generatePythonFiles(config) // Default to Python
 	}
@@ -152,14 +154,10 @@ func generatePythonFiles(config InstallConfig) error {
 }
 
 func generateTypeScriptFiles(config InstallConfig) error {
-	// Note: function size check removed - brace counting doesn't work for arrow functions,
-	// class methods, or functions with object literals. Needs proper AST parsing.
+	// Single comprehensive guardian.js with all checks including security
 	files := map[string]string{
-		".guardian/check_file_size.js":   tsCheckFileSize,
-		".guardian/check_dangerous.js":   tsCheckDangerous,
-		".guardian/check_mock_data.js":   tsCheckMockData,
-		".guardian/check_console_log.js": tsCheckConsoleLog,
-		".guardian/guardian.js":          tsGuardian,
+		".guardian/guardian.js":          tsGuardianFull,
+		".guardian/guardian.config.json": tsGuardianConfig,
 	}
 
 	for path, content := range files {
@@ -167,7 +165,11 @@ func generateTypeScriptFiles(config InstallConfig) error {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return err
 		}
-		if err := os.WriteFile(path, []byte(content), 0755); err != nil {
+		perm := os.FileMode(0755)
+		if filepath.Ext(path) == ".json" {
+			perm = 0644
+		}
+		if err := os.WriteFile(path, []byte(content), perm); err != nil {
 			return err
 		}
 	}
@@ -188,6 +190,29 @@ func generateGoFiles(config InstallConfig) error {
 			return err
 		}
 		if err := os.WriteFile(path, []byte(content), 0755); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func generatePhpFiles(config InstallConfig) error {
+	files := map[string]string{
+		".guardian/guardian.php":         phpGuardianScript,
+		".guardian/guardian.config.json": phpGuardianConfig,
+	}
+
+	for path, content := range files {
+		dir := filepath.Dir(path)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+		perm := os.FileMode(0755)
+		if filepath.Ext(path) == ".json" {
+			perm = 0644
+		}
+		if err := os.WriteFile(path, []byte(content), perm); err != nil {
 			return err
 		}
 	}
@@ -349,6 +374,16 @@ func generatePreCommitConfig(config InstallConfig) error {
         entry: node .guardian/guardian.js
         language: node
         types: [javascript, jsx, typescript, tsx]
+`
+	case "php":
+		guardianHook = `
+  - repo: local
+    hooks:
+      - id: guardian
+        name: Guardian checks
+        entry: php .guardian/guardian.php
+        language: system
+        types: [php]
 `
 	default:
 		guardianHook = `
@@ -1167,4 +1202,323 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+`
+
+// TypeScript guardian.js - from /Scaffolding/typescript/scripts/guardian.js + security
+const tsGuardianFull = `#!/usr/bin/env node
+/**
+ * Guardian: Catches TypeScript bugs and security issues.
+ * Configure via guardian.config.json in project root.
+ */
+const fs = require("fs");
+const path = require("path");
+
+const DEFAULT_CONFIG = {
+  srcDirs: ["src", "."],
+  exclude: ["node_modules", "dist", "build", ".next", "coverage", ".guardian"],
+  limits: { maxFileLines: 500, maxFunctionLines: 50 },
+  quality: {
+    banConsoleLog: true, banTodo: true, banAny: true,
+    banNonNullAssertions: true, banMockData: true,
+    mockPatterns: ["mock", "fake", "dummy", "stub", "testUser", "example@", "placeholder", "CHANGEME"]
+  },
+  security: { banEval: true, checkSqlInjection: true, checkXss: true, checkSecrets: true }
+};
+
+function loadConfig() {
+  try {
+    const p = path.join(process.cwd(), "guardian.config.json");
+    if (fs.existsSync(p)) {
+      const u = JSON.parse(fs.readFileSync(p, "utf-8"));
+      return { ...DEFAULT_CONFIG, ...u, limits: { ...DEFAULT_CONFIG.limits, ...u.limits },
+        quality: { ...DEFAULT_CONFIG.quality, ...u.quality }, security: { ...DEFAULT_CONFIG.security, ...u.security }};
+    }
+  } catch (e) { process.stderr.write("guardian: config parse error\n"); }
+  return DEFAULT_CONFIG;
+}
+
+function shouldExclude(f, exc) { return exc.some(p => f.includes(p.replace("**/", ""))); }
+function* walkDir(dir, exc) {
+  if (!fs.existsSync(dir)) return;
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const fp = path.join(dir, e.name);
+    if (shouldExclude(fp, exc)) continue;
+    if (e.isDirectory()) yield* walkDir(fp, exc);
+    else if (/\.(ts|tsx|js|jsx)$/.test(e.name)) yield fp;
+  }
+}
+function isComment(l) { const t = l.trim(); return t.startsWith("//") || t.startsWith("/*") || t.startsWith("*"); }
+
+// Quality checks
+function checkFileSize(fp, lines, cfg) {
+  if (lines.length > cfg.limits.maxFileLines)
+    return [fp + ": " + lines.length + " lines (max " + cfg.limits.maxFileLines + ")"];
+  return [];
+}
+function checkConsole(fp, lines, cfg) {
+  if (!cfg.quality.banConsoleLog) return [];
+  for (var i = 0; i < lines.length; i++) {
+    if (!isComment(lines[i]) && /console\.(log|debug|info)\s*\(/.test(lines[i]))
+      return [fp + ":" + (i+1) + ": console.log found"];
+  }
+  return [];
+}
+function checkTodo(fp, lines, cfg) {
+  if (!cfg.quality.banTodo) return [];
+  for (var i = 0; i < lines.length; i++) {
+    if (/\b(TODO|FIXME)\b/i.test(lines[i])) return [fp + ":" + (i+1) + ": TODO/FIXME found"];
+  }
+  return [];
+}
+function checkAny(fp, lines, cfg) {
+  if (!cfg.quality.banAny) return [];
+  for (var i = 0; i < lines.length; i++) {
+    if (!isComment(lines[i]) && /:\s*any\b|<any>|as\s+any\b/.test(lines[i]))
+      return [fp + ":" + (i+1) + ": explicit 'any' type"];
+  }
+  return [];
+}
+function checkMockData(fp, lines, cfg) {
+  if (!cfg.quality.banMockData) return [];
+  for (var j = 0; j < cfg.quality.mockPatterns.length; j++) {
+    var p = cfg.quality.mockPatterns[j];
+    for (var i = 0; i < lines.length; i++) {
+      if (!isComment(lines[i]) && lines[i].toLowerCase().indexOf(p.toLowerCase()) >= 0)
+        return [fp + ":" + (i+1) + ": mock/fake data '" + p + "'"];
+    }
+  }
+  return [];
+}
+
+// Security checks
+function checkEval(fp, lines, cfg) {
+  if (!cfg.security.banEval) return [];
+  for (var i = 0; i < lines.length; i++) {
+    if (!isComment(lines[i]) && /\beval\s*\(|new\s+Function\s*\(/.test(lines[i]))
+      return [fp + ":" + (i+1) + ": eval/Function is dangerous"];
+  }
+  return [];
+}
+function checkSql(fp, lines, cfg) {
+  if (!cfg.security.checkSqlInjection) return [];
+  for (var i = 0; i < lines.length; i++) {
+    if (!isComment(lines[i]) && /(SELECT|INSERT|UPDATE|DELETE).*\$\{/i.test(lines[i]))
+      return [fp + ":" + (i+1) + ": SQL injection risk"];
+  }
+  return [];
+}
+function checkXss(fp, lines, cfg) {
+  if (!cfg.security.checkXss) return [];
+  for (var i = 0; i < lines.length; i++) {
+    if (!isComment(lines[i]) && /\.innerHTML\s*=|dangerouslySetInnerHTML/.test(lines[i]))
+      return [fp + ":" + (i+1) + ": XSS risk"];
+  }
+  return [];
+}
+function checkSecrets(fp, lines, cfg) {
+  if (!cfg.security.checkSecrets) return [];
+  var pats = [/['"]sk-[a-zA-Z0-9]{20,}['"]/, /['"]ghp_[a-zA-Z0-9]{30,}['"]/, /['"]AKIA[A-Z0-9]{16}['"]/,
+    /password\s*[:=]\s*['"][^'"]{8,}['"]/, /api_?key\s*[:=]\s*['"][^'"]{8,}['"]/];
+  for (var i = 0; i < lines.length; i++) {
+    if (isComment(lines[i])) continue;
+    for (var j = 0; j < pats.length; j++) { if (pats[j].test(lines[i])) return [fp + ":" + (i+1) + ": hardcoded secret"]; }
+  }
+  return [];
+}
+
+function checkFile(fp, cfg) {
+  var content = fs.readFileSync(fp, "utf-8");
+  var lines = content.split("\n");
+  var r = [];
+  r = r.concat(checkFileSize(fp, lines, cfg), checkConsole(fp, lines, cfg));
+  r = r.concat(checkTodo(fp, lines, cfg), checkAny(fp, lines, cfg));
+  r = r.concat(checkMockData(fp, lines, cfg), checkEval(fp, lines, cfg));
+  r = r.concat(checkSql(fp, lines, cfg), checkXss(fp, lines, cfg), checkSecrets(fp, lines, cfg));
+  return r;
+}
+
+function main() {
+  var cfg = loadConfig();
+  var violations = [];
+  var count = 0;
+  for (var d = 0; d < cfg.srcDirs.length; d++) {
+    var iter = walkDir(cfg.srcDirs[d], cfg.exclude);
+    var next = iter.next();
+    while (!next.done) { count++; try { violations = violations.concat(checkFile(next.value, cfg)); } catch(e){} next = iter.next(); }
+  }
+  if (count === 0) { process.stdout.write("guardian: no files found\n"); process.exit(0); }
+  if (violations.length > 0) {
+    var uniq = violations.filter(function(v,i,a){return a.indexOf(v)===i;}).sort();
+    for (var i = 0; i < uniq.length; i++) process.stdout.write("  " + uniq[i] + "\n");
+    process.stdout.write(uniq.length + " issue(s)\n");
+    process.exit(1);
+  }
+  process.stdout.write("guardian: " + count + " files OK\n");
+}
+main();
+`
+
+const tsGuardianConfig = `{
+  "srcDirs": ["src", "."],
+  "exclude": ["node_modules", "dist", "build", ".guardian"],
+  "limits": { "maxFileLines": 500, "maxFunctionLines": 50 },
+  "quality": { "banConsoleLog": true, "banTodo": true, "banAny": true, "banMockData": true,
+    "mockPatterns": ["mock", "fake", "dummy", "testUser", "example@", "CHANGEME"] },
+  "security": { "banEval": true, "checkSqlInjection": true, "checkXss": true, "checkSecrets": true }
+}
+`
+
+// PHP guardian script - compact version with essential checks
+const phpGuardianScript = `#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+$CONFIG = [
+    'srcDirs' => ['src', 'app', '.'],
+    'exclude' => ['vendor', 'tests', 'storage', 'cache', '.guardian'],
+    'limits' => ['maxFileLines' => 500],
+    'quality' => ['banVarDump' => true, 'banTodo' => true, 'banMockData' => true,
+        'mockPatterns' => ['mock_', 'fake_', 'dummy_', 'test_user', 'example@', 'CHANGEME']],
+    'security' => ['banEval' => true, 'banExec' => true, 'checkSql' => true, 'checkXss' => true, 'checkSecrets' => true]
+];
+
+function loadConfig(): array {
+    global $CONFIG;
+    $path = getcwd() . '/guardian.config.json';
+    if (file_exists($path)) {
+        $user = json_decode(file_get_contents($path), true);
+        if ($user) return array_replace_recursive($CONFIG, $user);
+    }
+    return $CONFIG;
+}
+
+function iterFiles(string $dir, array $exclude): Generator {
+    if (!is_dir($dir)) return;
+    $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS));
+    foreach ($iter as $file) {
+        $path = $file->getPathname();
+        $skip = false;
+        foreach ($exclude as $pat) { if (strpos($path, $pat) !== false) { $skip = true; break; } }
+        if (!$skip && $file->isFile() && pathinfo($path, PATHINFO_EXTENSION) === 'php') yield $path;
+    }
+}
+
+function isComment(string $line): bool {
+    $t = trim($line);
+    return str_starts_with($t, '//') || str_starts_with($t, '#') || str_starts_with($t, '/*') || str_starts_with($t, '*');
+}
+
+function checkFileSize(string $fp, array $lines, array $cfg): array {
+    $max = $cfg['limits']['maxFileLines'];
+    if (count($lines) > $max) return ["$fp: " . count($lines) . " lines (max $max)"];
+    return [];
+}
+
+function checkDebug(string $fp, array $lines, array $cfg): array {
+    if (!$cfg['quality']['banVarDump']) return [];
+    foreach ($lines as $i => $line) {
+        if (isComment($line)) continue;
+        if (preg_match('/\b(var_dump|print_r|die|exit|dd)\s*\(/', $line))
+            return ["$fp:" . ($i+1) . ": debug statement found"];
+    }
+    return [];
+}
+
+function checkTodo(string $fp, array $lines, array $cfg): array {
+    if (!$cfg['quality']['banTodo']) return [];
+    foreach ($lines as $i => $line) {
+        if (preg_match('/\b(TODO|FIXME)\b/i', $line)) return ["$fp:" . ($i+1) . ": TODO/FIXME found"];
+    }
+    return [];
+}
+
+function checkMockData(string $fp, array $lines, array $cfg): array {
+    if (!$cfg['quality']['banMockData']) return [];
+    foreach ($cfg['quality']['mockPatterns'] as $pat) {
+        foreach ($lines as $i => $line) {
+            if (isComment($line)) continue;
+            if (stripos($line, $pat) !== false) return ["$fp:" . ($i+1) . ": mock data '$pat'"];
+        }
+    }
+    return [];
+}
+
+function checkDangerous(string $fp, array $lines, array $cfg): array {
+    if (!$cfg['security']['banEval'] && !$cfg['security']['banExec']) return [];
+    foreach ($lines as $i => $line) {
+        if (isComment($line)) continue;
+        if (preg_match('/\b(eval|exec|shell_exec|system|passthru|popen|proc_open)\s*\(/', $line))
+            return ["$fp:" . ($i+1) . ": dangerous function"];
+    }
+    return [];
+}
+
+function checkSql(string $fp, array $lines, array $cfg): array {
+    if (!$cfg['security']['checkSql']) return [];
+    foreach ($lines as $i => $line) {
+        if (isComment($line)) continue;
+        if (preg_match('/(SELECT|INSERT|UPDATE|DELETE).*\$_(GET|POST|REQUEST)/i', $line))
+            return ["$fp:" . ($i+1) . ": SQL injection risk"];
+    }
+    return [];
+}
+
+function checkXss(string $fp, array $lines, array $cfg): array {
+    if (!$cfg['security']['checkXss']) return [];
+    foreach ($lines as $i => $line) {
+        if (isComment($line)) continue;
+        if (preg_match('/echo\s+\$_(GET|POST|REQUEST)/', $line))
+            return ["$fp:" . ($i+1) . ": XSS risk - echo unsanitized input"];
+    }
+    return [];
+}
+
+function checkSecrets(string $fp, array $lines, array $cfg): array {
+    if (!$cfg['security']['checkSecrets']) return [];
+    $pats = ['/[\'"]sk-[a-zA-Z0-9]{20,}[\'"]/', '/password\s*[:=]\s*[\'"][^\'"]{8,}[\'"]/', '/api_?key\s*[:=]\s*[\'"][^\'"]{8,}[\'"]/'];
+    foreach ($lines as $i => $line) {
+        if (isComment($line)) continue;
+        foreach ($pats as $pat) { if (preg_match($pat, $line)) return ["$fp:" . ($i+1) . ": hardcoded secret"]; }
+    }
+    return [];
+}
+
+function checkFile(string $fp, array $cfg): array {
+    $content = file_get_contents($fp);
+    $lines = explode("\n", $content);
+    $r = [];
+    $r = array_merge($r, checkFileSize($fp, $lines, $cfg), checkDebug($fp, $lines, $cfg));
+    $r = array_merge($r, checkTodo($fp, $lines, $cfg), checkMockData($fp, $lines, $cfg));
+    $r = array_merge($r, checkDangerous($fp, $lines, $cfg), checkSql($fp, $lines, $cfg));
+    $r = array_merge($r, checkXss($fp, $lines, $cfg), checkSecrets($fp, $lines, $cfg));
+    return $r;
+}
+
+$cfg = loadConfig();
+$violations = [];
+$count = 0;
+foreach ($cfg['srcDirs'] as $dir) {
+    foreach (iterFiles($dir, $cfg['exclude']) as $fp) {
+        $count++;
+        try { $violations = array_merge($violations, checkFile($fp, $cfg)); } catch (Exception $e) {}
+    }
+}
+if ($count === 0) { fwrite(STDOUT, "guardian: no files found\n"); exit(0); }
+if (count($violations) > 0) {
+    $uniq = array_unique($violations); sort($uniq);
+    foreach ($uniq as $v) fwrite(STDOUT, "  $v\n");
+    fwrite(STDOUT, count($uniq) . " issue(s)\n");
+    exit(1);
+}
+fwrite(STDOUT, "guardian: $count files OK\n");
+`
+
+const phpGuardianConfig = `{
+  "srcDirs": ["src", "app", "."],
+  "exclude": ["vendor", "tests", "storage", "cache", ".guardian"],
+  "limits": { "maxFileLines": 500 },
+  "quality": { "banVarDump": true, "banTodo": true, "banMockData": true,
+    "mockPatterns": ["mock_", "fake_", "dummy_", "test_user", "example@", "CHANGEME"] },
+  "security": { "banEval": true, "banExec": true, "checkSql": true, "checkXss": true, "checkSecrets": true }
+}
 `
