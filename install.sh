@@ -2,9 +2,9 @@
 set -e
 
 # Guardian installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/forrest-aleq/guardian/main/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/cglabs-ai/guardian/main/install.sh | sh
 
-REPO="forrest-aleq/guardian"
+REPO="cglabs-ai/guardian"
 VERSION="v1.0.0"
 
 # Detect OS
